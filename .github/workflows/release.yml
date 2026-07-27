@@ -76,6 +76,15 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Generate checksums
+        # WolfStack's setup.sh verifies downloaded WolfNet binaries against
+        # this file before installing them and running them as root. Without
+        # it published here, that check can only warn and install unverified.
+        run: |
+          cd dist
+          sha256sum wolfnet-x86_64 wolfnet-aarch64 wolfnetctl-x86_64 wolfnetctl-aarch64 > SHA256SUMS
+          cat SHA256SUMS
+
       - name: Create or update release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -89,8 +98,9 @@ jobs:
           # Create release with binaries
           gh release create "$VERSION" \
             --title "WolfNet $VERSION" \
-            --notes "Prebuilt static binaries for Linux x86_64 and aarch64 (ARM64/Raspberry Pi 4+)." \
+            --notes "Prebuilt static binaries for Linux x86_64 and aarch64 (ARM64/Raspberry Pi 4+). Verify with \`sha256sum -c SHA256SUMS\`." \
             dist/wolfnet-x86_64 \
             dist/wolfnet-aarch64 \
             dist/wolfnetctl-x86_64 \
-            dist/wolfnetctl-aarch64
+            dist/wolfnetctl-aarch64 \
+            dist/SHA256SUMS
