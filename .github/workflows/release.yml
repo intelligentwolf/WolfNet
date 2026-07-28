@@ -12,6 +12,10 @@ on:
 jobs:
   build:
     strategy:
+      # A failure in one target must not cancel the others. Without this, the
+      # v0.5.31 riscv64 failure cancelled the three good builds and the release
+      # was never cut (2026-07-28).
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
@@ -20,16 +24,18 @@ jobs:
           - target: aarch64-unknown-linux-musl
             arch: aarch64
             runner: ubuntu-latest
-          # 32-bit ARM (Raspberry Pi on a 32-bit OS, older ARM NAS boxes) and
-          # riscv64. Added 2026-07-28: WolfStack's installer refuses to compile
-          # on a user's machine during an upgrade, so any architecture without
-          # a published binary silently stops receiving updates. Verified to
-          # compile clean for both targets before adding.
+          # 32-bit ARM (Raspberry Pi on a 32-bit OS, older ARM NAS boxes).
+          # Added 2026-07-28: WolfStack's installer refuses to compile on a
+          # user's machine during an upgrade, so any architecture without a
+          # published binary silently stops receiving updates.
+          #
+          # riscv64 was attempted and removed: cross has no riscv64 linker for
+          # the musl target, so rustc falls back to the host `cc` and fails
+          # with "file in wrong format". `cross check` passes because checking
+          # never links, so validate a NEW target with `cross build`, not
+          # `cross check`.
           - target: armv7-unknown-linux-musleabihf
             arch: armv7
-            runner: ubuntu-latest
-          - target: riscv64gc-unknown-linux-musl
-            arch: riscv64
             runner: ubuntu-latest
 
     runs-on: ${{ matrix.runner }}
@@ -109,13 +115,11 @@ jobs:
           # Create release with binaries
           gh release create "$VERSION" \
             --title "WolfNet $VERSION" \
-            --notes "Prebuilt static binaries for Linux x86_64, aarch64 (ARM64/Raspberry Pi 4+), armv7 (32-bit ARM) and riscv64. Verify with \`sha256sum -c SHA256SUMS\`." \
+            --notes "Prebuilt static binaries for Linux x86_64, aarch64 (ARM64/Raspberry Pi 4+) and armv7 (32-bit ARM). Verify with \`sha256sum -c SHA256SUMS\`." \
             dist/wolfnet-x86_64 \
             dist/wolfnet-aarch64 \
             dist/wolfnet-armv7 \
-            dist/wolfnet-riscv64 \
             dist/wolfnetctl-x86_64 \
             dist/wolfnetctl-aarch64 \
             dist/wolfnetctl-armv7 \
-            dist/wolfnetctl-riscv64 \
             dist/SHA256SUMS
