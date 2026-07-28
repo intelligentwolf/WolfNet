@@ -20,6 +20,17 @@ jobs:
           - target: aarch64-unknown-linux-musl
             arch: aarch64
             runner: ubuntu-latest
+          # 32-bit ARM (Raspberry Pi on a 32-bit OS, older ARM NAS boxes) and
+          # riscv64. Added 2026-07-28: WolfStack's installer refuses to compile
+          # on a user's machine during an upgrade, so any architecture without
+          # a published binary silently stops receiving updates. Verified to
+          # compile clean for both targets before adding.
+          - target: armv7-unknown-linux-musleabihf
+            arch: armv7
+            runner: ubuntu-latest
+          - target: riscv64gc-unknown-linux-musl
+            arch: riscv64
+            runner: ubuntu-latest
 
     runs-on: ${{ matrix.runner }}
     steps:
@@ -82,7 +93,7 @@ jobs:
         # it published here, that check can only warn and install unverified.
         run: |
           cd dist
-          sha256sum wolfnet-x86_64 wolfnet-aarch64 wolfnetctl-x86_64 wolfnetctl-aarch64 > SHA256SUMS
+          sha256sum wolfnet-* wolfnetctl-* > SHA256SUMS
           cat SHA256SUMS
 
       - name: Create or update release
@@ -98,9 +109,13 @@ jobs:
           # Create release with binaries
           gh release create "$VERSION" \
             --title "WolfNet $VERSION" \
-            --notes "Prebuilt static binaries for Linux x86_64 and aarch64 (ARM64/Raspberry Pi 4+). Verify with \`sha256sum -c SHA256SUMS\`." \
+            --notes "Prebuilt static binaries for Linux x86_64, aarch64 (ARM64/Raspberry Pi 4+), armv7 (32-bit ARM) and riscv64. Verify with \`sha256sum -c SHA256SUMS\`." \
             dist/wolfnet-x86_64 \
             dist/wolfnet-aarch64 \
+            dist/wolfnet-armv7 \
+            dist/wolfnet-riscv64 \
             dist/wolfnetctl-x86_64 \
             dist/wolfnetctl-aarch64 \
+            dist/wolfnetctl-armv7 \
+            dist/wolfnetctl-riscv64 \
             dist/SHA256SUMS
