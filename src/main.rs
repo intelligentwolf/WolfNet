@@ -57,12 +57,60 @@ enum Commands {
         address: String,
     },
     /// Generate an invite token for a new peer to join your network
-    Invite,
+    Invite {
+        /// Address peers should reach this node on, as `ip:port`.
+        /// Overrides public-IP auto-detection — use it when peers reach
+        /// you on a LAN or VPN address that detection cannot guess
+        /// (e.g. 10.10.10.30:9600).
+        #[arg(short, long)]
+        endpoint: Option<String>,
+    },
     /// Join a WolfNet network using an invite token
     Join {
         /// The invite token from 'wolfnet invite'
         token: String,
+        /// Reach the inviting node at this `ip:port` instead of the
+        /// address baked into the token. For a token you have already
+        /// been given whose endpoint is wrong or unreachable.
+        #[arg(short, long)]
+        endpoint: Option<String>,
     },
+}
+
+/// Reject an endpoint override that isn't `host:port` before it reaches
+/// a config file, where the failure would surface much later as a peer
+/// that simply never connects.
+fn validate_endpoint(ep: &str) -> Result<(), String> {
+    let ep = ep.trim();
+    if ep.is_empty() {
+        return Err("endpoint is empty".into());
+    }
+    // Split on the LAST colon so bare IPv6 literals are diagnosed
+    // usefully rather than mistaken for host:port.
+    let (host, port) = ep.rsplit_once(':')
+        .ok_or_else(|| format!("'{}' has no port — use ip:port, e.g. 10.10.10.30:9600", ep))?;
+    if host.is_empty() {
+        return Err(format!("'{}' has no host part — use ip:port", ep));
+    }
+    // A bare IPv6 literal splits misleadingly: "fd00::5" yields host
+    // "fd00:" and port "5", which parses cleanly and would be accepted
+    // as a valid endpoint the operator never meant. Require brackets so
+    // the address and the port stay unambiguous.
+    if host.contains(':') && !(host.starts_with('[') && host.ends_with(']')) {
+        return Err(format!(
+            "'{}' looks like a bare IPv6 address — bracket it as [addr]:port, \
+             e.g. [fd00::5]:9600",
+            ep,
+        ));
+    }
+    match port.parse::<u16>() {
+        Ok(0) => Err(format!("'{}' has port 0, which cannot be connected to", ep)),
+        Ok(_) => Ok(()),
+        Err(_) => Err(format!(
+            "'{}' has a non-numeric port ('{}') — use ip:port, e.g. 10.10.10.30:9600",
+            ep, port,
+        )),
+    }
 }
 
 /// Encrypt plaintext into send_buf and send to peer via UDP. Zero heap allocations.
@@ -103,7 +151,7 @@ fn main() {
 
     // Commands that need root access (for /etc/wolfnet/)
     match &cli.command {
-        Some(Commands::Invite) | Some(Commands::Join { .. }) | None => {
+        Some(Commands::Invite { .. }) | Some(Commands::Join { .. }) | None => {
             if unsafe { libc::geteuid() } != 0 {
                 eprintln!("✗ This command needs root access (to read /etc/wolfnet/).");
                 eprintln!("  Run with: sudo wolfnet {}", std::env::args().skip(1).collect::<Vec<_>>().join(" "));
@@ -118,8 +166,8 @@ fn main() {
         Some(Commands::Pubkey) => cmd_pubkey(&cli.config),
         Some(Commands::Token) => cmd_token(&cli.config),
         Some(Commands::Init { address }) => cmd_init(&cli.config, &address),
-        Some(Commands::Invite) => cmd_invite(&cli.config),
-        Some(Commands::Join { token }) => cmd_join(&cli.config, &token),
+        Some(Commands::Invite { endpoint }) => cmd_invite(&cli.config, endpoint.as_deref()),
+        Some(Commands::Join { token, endpoint }) => cmd_join(&cli.config, &token, endpoint.as_deref()),
         None => run_daemon(&cli.config),
     }
 }
@@ -254,20 +302,39 @@ fn detect_public_ip() -> Option<String> {
     None
 }
 
-fn cmd_invite(config_path: &PathBuf) {
+fn cmd_invite(config_path: &PathBuf, endpoint_override: Option<&str>) {
     let config = load_config(config_path);
     let kp = KeyPair::load_or_generate(&config.security.private_key_file).unwrap_or_else(|e| {
         error!("{}", e); std::process::exit(1);
     });
 
-    // Auto-detect public IP
-    let public_ip = detect_public_ip();
-    let endpoint = match &public_ip {
-        Some(ip) => format!("{}:{}", ip, config.network.listen_port),
+    // An explicit --endpoint wins over detection. Detection can only ever
+    // find a PUBLIC address, so a mesh reached over a LAN or VPN address
+    // (10.10.10.30:9600) could not be invited correctly at all before
+    // this — and because the endpoint lives INSIDE the base64 token,
+    // there was nothing an operator could usefully edit afterwards
+    // (klasSponsor 2026-07-29).
+    let endpoint = match endpoint_override {
+        Some(ep) => {
+            if let Err(e) = validate_endpoint(ep) {
+                error!("Invalid --endpoint: {}", e);
+                std::process::exit(1);
+            }
+            ep.trim().to_string()
+        }
         None => {
-            eprintln!("⚠ Could not auto-detect public IP. Using local address.");
-            eprintln!("  If this node is behind NAT, peers will need a relay node.");
-            format!("{}:{}", config.network.address, config.network.listen_port)
+            // Auto-detect public IP
+            let public_ip = detect_public_ip();
+            match &public_ip {
+                Some(ip) => format!("{}:{}", ip, config.network.listen_port),
+                None => {
+                    eprintln!("⚠ Could not auto-detect public IP. Using local address.");
+                    eprintln!("  If this node is behind NAT, peers will need a relay node.");
+                    eprintln!("  If peers reach you on a LAN/VPN address, re-run with:");
+                    eprintln!("    wolfnet invite --endpoint <ip>:{}", config.network.listen_port);
+                    format!("{}:{}", config.network.address, config.network.listen_port)
+                }
+            }
         }
     };
 
@@ -317,26 +384,68 @@ fn derive_peer_name(hostname: Option<&str>, pubkey: &str) -> String {
     format!("invited-{}", suffix)
 }
 
-fn cmd_join(config_path: &PathBuf, token: &str) {
+fn cmd_join(config_path: &PathBuf, token: &str, endpoint_override: Option<&str>) {
     use base64::Engine;
     use wolfnet::config::PeerConfig;
 
-    // Decode token
+    if let Some(ep) = endpoint_override {
+        if let Err(e) = validate_endpoint(ep) {
+            error!("Invalid --endpoint: {}", e);
+            std::process::exit(1);
+        }
+    }
+
+    // Decode token.
+    //
+    // The failure message matters more than it looks. The token is one
+    // opaque base64 blob whose JSON payload CONTAINS the endpoint, so
+    // an operator whose invite carries an unreachable address reaches
+    // for the obvious fix — editing the IP they can see at the end of
+    // the token — and silently corrupts the base64 instead. That is
+    // exactly what happened (klasSponsor 2026-07-29): repeated attempts,
+    // in compose and in .env, all failing here with a bare decode error
+    // that named neither the cause nor the remedy.
     let decoded = base64::engine::general_purpose::STANDARD.decode(token.trim()).unwrap_or_else(|e| {
         error!("Invalid invite token: {}", e);
+        eprintln!();
+        eprintln!("  The token is a single encoded blob — paste it EXACTLY as");
+        eprintln!("  'wolfnet invite' printed it, with nothing added or edited.");
+        eprintln!();
+        eprintln!("  The peer's address is stored INSIDE the token, so editing the");
+        eprintln!("  IP you can see in it corrupts the whole thing. To reach the");
+        eprintln!("  inviting node at a different address, keep the token intact");
+        eprintln!("  and override it:");
+        eprintln!();
+        eprintln!("    wolfnet join <token> --endpoint 10.10.10.30:9600");
+        eprintln!();
+        eprintln!("  Or have the inviting node issue a correct token in the first");
+        eprintln!("  place:  wolfnet invite --endpoint <ip>:<port>");
         std::process::exit(1);
     });
     let invite: serde_json::Value = serde_json::from_slice(&decoded).unwrap_or_else(|e| {
         error!("Invalid invite token format: {}", e);
+        eprintln!("  The token decoded but isn't a WolfNet invite. Re-copy it from");
+        eprintln!("  'wolfnet invite' on the node you're joining.");
         std::process::exit(1);
     });
 
     let peer_pubkey = invite["pk"].as_str().unwrap_or_else(|| {
         error!("Token missing public key"); std::process::exit(1);
     });
-    let peer_endpoint = invite["ep"].as_str().unwrap_or_else(|| {
+    let token_endpoint = invite["ep"].as_str().unwrap_or_else(|| {
         error!("Token missing endpoint"); std::process::exit(1);
     });
+    // --endpoint replaces the address baked into the token. The rest of
+    // the token (public key, peer IP, subnet) is still authoritative —
+    // only where we send packets changes.
+    let peer_endpoint = match endpoint_override {
+        Some(ep) => {
+            let ep = ep.trim();
+            println!("→ Using --endpoint {} instead of the token's {}", ep, token_endpoint);
+            ep.to_string()
+        }
+        None => token_endpoint.to_string(),
+    };
     let peer_ip = invite["ip"].as_str().unwrap_or_else(|| {
         error!("Token missing IP"); std::process::exit(1);
     });
@@ -1182,5 +1291,59 @@ mod join_name_tests {
         // And never the bare colliding name that created the ghost.
         assert_ne!(a, "invited-peer");
         assert_ne!(b, "invited-peer");
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use super::validate_endpoint;
+
+    // ── --endpoint validation ────────────────────────────────────
+    //
+    // The endpoint lives INSIDE the base64 invite token, so before
+    // --endpoint existed the only apparent way to correct it was to
+    // edit the token — which corrupts the base64 and fails with
+    // "Invalid invite token" no matter how carefully the IP is typed
+    // (klasSponsor 2026-07-29). These pin the override's own input
+    // checking so a typo fails immediately rather than becoming a peer
+    // that silently never connects.
+
+    #[test]
+    fn endpoint_accepts_ip_port() {
+        assert!(validate_endpoint("10.10.10.30:9600").is_ok());
+        assert!(validate_endpoint("192.0.2.1:1").is_ok());
+        assert!(validate_endpoint("vpn.example.com:9600").is_ok());
+        // Surrounding whitespace is the normal result of a copy-paste.
+        assert!(validate_endpoint("  10.10.10.30:9600  ").is_ok());
+    }
+
+    #[test]
+    fn endpoint_rejects_a_missing_or_bad_port() {
+        // The most likely typo: the IP alone.
+        let e = validate_endpoint("10.10.10.30").unwrap_err();
+        assert!(e.contains("no port"), "{}", e);
+        assert!(e.contains("10.10.10.30:9600"), "error should show the shape: {}", e);
+
+        assert!(validate_endpoint("10.10.10.30:").is_err());
+        assert!(validate_endpoint("10.10.10.30:http").is_err());
+        assert!(validate_endpoint("10.10.10.30:99999").is_err(), "port must fit u16");
+        assert!(validate_endpoint("10.10.10.30:0").is_err(), "port 0 is unconnectable");
+        assert!(validate_endpoint(":9600").is_err());
+        assert!(validate_endpoint("").is_err());
+        assert!(validate_endpoint("   ").is_err());
+    }
+
+    #[test]
+    fn endpoint_splits_on_the_last_colon_for_ipv6() {
+        // A bare IPv6 literal has colons of its own. Splitting on the
+        // FIRST colon would call "fd00::5" a host of "fd00" with port
+        // ":5" and produce a baffling message; splitting on the last
+        // gives an honest one about the port.
+        assert!(validate_endpoint("[fd00::5]:9600").is_ok());
+        // Unbracketed, this parses as host "fd00:" port "5" — accepted
+        // silently before the bracket check, then never connects.
+        let e = validate_endpoint("fd00::5").unwrap_err();
+        assert!(e.contains("IPv6") && e.contains("bracket"), "{}", e);
+        assert!(validate_endpoint("fd00::5:9600").is_err(), "still ambiguous without brackets");
     }
 }

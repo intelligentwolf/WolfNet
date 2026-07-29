@@ -4,6 +4,15 @@
 #   WOLFNET_JOIN_TOKEN=<token> docker compose up -d
 #
 # Get the join token by running `wolfnet invite` on an existing WolfNet node.
+# Paste it EXACTLY as printed — it is one encoded blob, and the peer's
+# address is stored inside it. Editing the IP you can see in the token
+# corrupts it ("Invalid invite token").
+#
+# If the inviting node is reached on a LAN/VPN address rather than the
+# public IP it auto-detected, keep the token intact and set:
+#   WOLFNET_JOIN_ENDPOINT=10.10.10.30:9600
+# (or issue a correct token in the first place with
+#  `wolfnet invite --endpoint <ip>:<port>`).
 
 services:
   wolfnet:
@@ -20,6 +29,7 @@ services:
       - /run/wolfnet:/var/run/wolfnet
     environment:
       - WOLFNET_JOIN_TOKEN=${WOLFNET_JOIN_TOKEN:-}
+      - WOLFNET_JOIN_ENDPOINT=${WOLFNET_JOIN_ENDPOINT:-}
       # Optional overrides:
       # - WOLFNET_ADDRESS=10.0.10.5
       # - WOLFNET_PORT=9600

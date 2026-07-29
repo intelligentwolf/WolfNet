@@ -22,7 +22,17 @@ fi
 if [ ! -f "$CONFIG" ]; then
     if [ -n "$WOLFNET_JOIN_TOKEN" ]; then
         echo "→ Joining WolfNet using supplied invite token..."
-        wolfnet --config "$CONFIG" join "$WOLFNET_JOIN_TOKEN"
+        # WOLFNET_JOIN_ENDPOINT overrides the address inside the token.
+        # Needed whenever the inviting node auto-detected a public IP but
+        # is actually reached on a LAN/VPN address. Without it the only
+        # apparent fix is editing the IP visible in the token, which
+        # corrupts the base64 and fails with "Invalid invite token".
+        if [ -n "$WOLFNET_JOIN_ENDPOINT" ]; then
+            echo "  (reaching the inviting node at $WOLFNET_JOIN_ENDPOINT)"
+            wolfnet --config "$CONFIG" join "$WOLFNET_JOIN_TOKEN" --endpoint "$WOLFNET_JOIN_ENDPOINT"
+        else
+            wolfnet --config "$CONFIG" join "$WOLFNET_JOIN_TOKEN"
+        fi
     else
         ADDRESS="${WOLFNET_ADDRESS:-10.0.10.1}"
         echo "→ No config and no join token — initialising new network at $ADDRESS"
