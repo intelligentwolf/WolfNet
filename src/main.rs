@@ -887,18 +887,22 @@ fn run_daemon(config_path: &PathBuf) {
                         if let Some((pub_key, peer_ip, _peer_port, is_gw, peer_hostname)) = transport::parse_handshake(data) {
                             let endpoint = src;
                             peer_manager.update_from_discovery(&pub_key, endpoint, peer_ip, &peer_hostname, is_gw);
-                            // Check if peer was already connected BEFORE re-establishing session
-                            let was_connected = peer_manager.with_peer_by_ip(&peer_ip, |peer| {
-                                peer.is_connected()
-                            }).unwrap_or(false);
-                            peer_manager.with_peer_by_ip(&peer_ip, |peer| {
+                            // Answer, but rate-limited per peer. A handshake from a
+                            // peer we already think is connected means IT thinks we
+                            // are down (a restarted daemon), so staying silent leaves
+                            // it showing us offline forever — its own handshakes keep
+                            // refreshing our last_seen, so we never time it out and
+                            // never speak first. See should_send_handshake_reply.
+                            let should_reply = peer_manager.with_peer_by_ip(&peer_ip, |peer| {
+                                let reply = peer.should_send_handshake_reply();
+                                if reply {
+                                    peer.last_handshake_reply = Some(Instant::now());
+                                }
                                 peer.establish_session(&keypair.secret, &keypair.public);
                                 peer.last_seen = Some(Instant::now());
-                            });
-                            // Only reply if peer was NOT already connected — prevents
-                            // handshake ping-pong where two nodes bounce handshakes
-                            // back and forth at wire speed, burning CPU
-                            if !was_connected {
+                                reply
+                            }).unwrap_or(false);
+                            if should_reply {
                                 let reply = transport::build_handshake(&keypair, wolfnet_ip, config.network.listen_port, &hostname, is_gateway);
                                 let _ = socket.send_to(&reply, src);
                             }

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 #[allow(unused_imports)]
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -53,7 +53,19 @@ pub struct Peer {
     /// on 2026-05-11 where wolfnetctl said "6 (6 connected)" while
     /// every ping silently failed.
     pub last_data_rx: Option<Instant>,
+    /// Last time we sent this peer a handshake REPLY (as opposed to one of
+    /// our own periodic handshakes). Replies used to be suppressed outright
+    /// whenever we already considered the peer connected, to stop two nodes
+    /// bouncing handshakes at wire speed. That guard also removed the only
+    /// way a peer whose daemon has restarted could learn we are alive — see
+    /// `should_send_handshake_reply`.
+    pub last_handshake_reply: Option<Instant>,
 }
+
+/// Minimum gap between handshake replies to the same peer. Bounds the reply
+/// rate to one packet per peer per interval, which is what stops the
+/// ping-pong storm, while still answering a restarted peer promptly.
+pub const HANDSHAKE_REPLY_MIN_INTERVAL: Duration = Duration::from_secs(10);
 
 impl Peer {
     /// Create a new peer from config
@@ -74,6 +86,7 @@ impl Peer {
             relay_via: None,
             configured_endpoint: None,
             last_data_rx: None,
+            last_handshake_reply: None,
         }
     }
 
@@ -101,6 +114,44 @@ impl Peer {
     /// tunnel "looks up" (handshakes flow) but data drops on the floor.
     pub fn is_passing_data(&self) -> bool {
         self.cipher.is_some() && self.last_data_rx.map_or(false, |t| t.elapsed().as_secs() < 120)
+    }
+
+    /// Whether to answer an inbound handshake from this peer.
+    ///
+    /// A handshake from a peer we already consider connected means that peer
+    /// no longer considers US connected — it only sends handshakes to peers
+    /// it thinks are down. That is exactly what a peer looks like after its
+    /// daemon restarts, and it is a request for proof that we are alive.
+    ///
+    /// Answering unconditionally caused two nodes to bounce handshakes at
+    /// wire speed. Suppressing the answer entirely (the previous fix) broke
+    /// recovery instead, and permanently: a restarted node handshakes us
+    /// every 10s, and each one refreshes OUR last_seen for it — so we stay
+    /// "connected" forever, never time it out, and never speak. It hears
+    /// nothing back and shows us offline until someone restarts every node at
+    /// once. Reported by sabur7 on 2026-07-29 as peers vanishing after every
+    /// cluster upgrade and not returning until the whole cluster rebooted.
+    ///
+    /// Measured with two daemons in a sandbox, restarting only one and
+    /// generating no traffic (scratchpad/wolfnet-recovery-test.sh):
+    ///
+    ///   restarted node's view of its peer:  connected=false, last_seen=never
+    ///   the other node's view of IT:        connected=true,  last_seen=5s
+    ///
+    /// still true 40s later, and it does not resolve on its own. Note the 25s
+    /// keepalive is NOT a fallback here — it is sent only to peers we consider
+    /// connected, and it did not restore the restarted node's view even with a
+    /// perfectly reachable endpoint. The handshake reply is the only path back.
+    ///
+    /// So: always answer, but at most once per HANDSHAKE_REPLY_MIN_INTERVAL
+    /// per peer. That keeps the storm bounded to one packet per peer per
+    /// interval and restores self-healing (measured: recovery in ~15s, in both
+    /// the reachable-endpoint and stale-endpoint cases).
+    pub fn should_send_handshake_reply(&self) -> bool {
+        match self.last_handshake_reply {
+            None => true,
+            Some(t) => t.elapsed() >= HANDSHAKE_REPLY_MIN_INTERVAL,
+        }
     }
 
     /// Encrypt a packet for this peer
@@ -808,6 +859,53 @@ mod peer_state_tests {
         let secret = StaticSecret::random_from_rng(rand::thread_rng());
         let public = PublicKey::from(&secret);
         Peer::new(public, "10.100.10.1".parse().unwrap())
+    }
+
+    /// The regression sabur7 hit (2026-07-29): after a cluster upgrade the
+    /// restarted node showed every peer offline until ALL nodes were rebooted.
+    /// A peer we already consider connected that keeps handshaking us is a
+    /// peer that does NOT consider us connected — staying silent strands it,
+    /// because its own handshakes keep refreshing our last_seen so we never
+    /// time it out and never speak first.
+    #[test]
+    fn a_peer_that_has_never_been_answered_gets_a_reply() {
+        let p = make_peer();
+        assert!(p.should_send_handshake_reply(),
+            "a peer we have never replied to must be answered, connected or not");
+    }
+
+    #[test]
+    fn replies_are_rate_limited_to_stop_the_ping_pong_storm() {
+        let mut p = make_peer();
+        p.last_handshake_reply = Some(Instant::now());
+        assert!(!p.should_send_handshake_reply(),
+            "a reply sent just now must suppress the next one — this is what stopped \
+             two nodes bouncing handshakes at wire speed");
+    }
+
+    /// The rate limit must EXPIRE. If it did not, this would be the old
+    /// permanent-silence bug wearing a different hat.
+    #[test]
+    fn the_rate_limit_expires_so_recovery_is_always_possible() {
+        let mut p = make_peer();
+        p.last_handshake_reply = Instant::now().checked_sub(HANDSHAKE_REPLY_MIN_INTERVAL);
+        assert!(p.last_handshake_reply.is_some(), "test setup: clock must support the offset");
+        assert!(p.should_send_handshake_reply(),
+            "once the interval has elapsed the peer must be answerable again");
+    }
+
+    /// Being connected must NOT suppress a reply — that conflation is the
+    /// exact bug. Explicitly pin the property so it cannot be reintroduced.
+    #[test]
+    fn connectedness_does_not_gate_the_reply() {
+        let mut p = make_peer();
+        let secret = StaticSecret::random_from_rng(rand::thread_rng());
+        let public = PublicKey::from(&secret);
+        p.establish_session(&secret, &public);
+        p.last_seen = Some(Instant::now());
+        assert!(p.is_connected(), "test setup: peer should read as connected");
+        assert!(p.should_send_handshake_reply(),
+            "a connected peer still gets answered — it is asking BECAUSE it thinks we are down");
     }
 
     #[test]
