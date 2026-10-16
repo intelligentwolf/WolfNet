@@ -309,6 +309,11 @@ impl PeerManager {
         self.purged_ips.write().unwrap().insert(*ip);
     }
 
+    /// Whether `ip` is a known peer's WolfNet address
+    pub fn is_peer_ip(&self, ip: &Ipv4Addr) -> bool {
+        self.peers_by_ip.read().unwrap().contains_key(ip)
+    }
+
     /// Get a mutable reference to a peer by WolfNet IP (via callback to avoid lock issues)
     pub fn with_peer_by_ip<F, R>(&self, ip: &Ipv4Addr, f: F) -> Option<R>
     where F: FnOnce(&mut Peer) -> R {

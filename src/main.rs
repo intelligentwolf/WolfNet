@@ -589,6 +589,9 @@ fn run_daemon(config_path: &PathBuf) {
     });
 
     info!("WolfNet starting — {} on {}", wolfnet_ip, config.network.interface);
+    // From the same prefix the TUN is configured with, so WolfNet and the
+    // kernel agree on which address is the broadcast.
+    let overlay_broadcast = config.broadcast_addr();
 
     // Load or generate keypair
     let keypair = Arc::new(KeyPair::load_or_generate(&config.security.private_key_file).unwrap_or_else(|e| {
@@ -783,12 +786,16 @@ fn run_daemon(config_path: &PathBuf) {
                 let pkt = &tun_buf[..n as usize];
 
                 if let Some(dest_ip) = tun::get_dest_ip(pkt) {
-                    let subnet_broadcast = Ipv4Addr::new(
-                        wolfnet_ip.octets()[0], wolfnet_ip.octets()[1],
-                        wolfnet_ip.octets()[2], 255,
-                    );
-
-                    if dest_ip == subnet_broadcast || dest_ip == Ipv4Addr::BROADCAST {
+                    if Some(dest_ip) == overlay_broadcast || dest_ip == Ipv4Addr::BROADCAST {
+                        // A broadcast whose source is another WolfNet node
+                        // did not start here: the kernel forwarded a copy we
+                        // delivered. Sending it on again is a broadcast loop
+                        // between the nodes, so drop it.
+                        if let Some(src_ip) = tun::get_src_ip(pkt) {
+                            if src_ip != wolfnet_ip && peer_manager.is_peer_ip(&src_ip) {
+                                continue;
+                            }
+                        }
                         // Broadcast: encrypt and send to all connected peers (single lock)
                         broadcast_relayed.clear();
                         broadcast_targets.clear();
@@ -952,12 +959,7 @@ fn run_daemon(config_path: &PathBuf) {
 
                                     // Route: for us, broadcast, or relay
                                     if let Some(dest_ip) = tun::get_dest_ip(plaintext) {
-                                        let subnet_bcast = Ipv4Addr::new(
-                                            wolfnet_ip.octets()[0], wolfnet_ip.octets()[1],
-                                            wolfnet_ip.octets()[2], 255,
-                                        );
-
-                                        if dest_ip == wolfnet_ip || dest_ip == subnet_bcast || dest_ip == Ipv4Addr::BROADCAST {
+                                        if dest_ip == wolfnet_ip || Some(dest_ip) == overlay_broadcast || dest_ip == Ipv4Addr::BROADCAST {
                                             unsafe { libc::write(tun_fd, plaintext.as_ptr() as *const _, pt_len) };
                                         } else {
                                             // Relay: re-encrypt for destination peer

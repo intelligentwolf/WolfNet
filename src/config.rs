@@ -338,6 +338,29 @@ impl Config {
     pub fn cidr(&self) -> String {
         format!("{}/{}", self.network.address, self.network.subnet)
     }
+
+    /// The overlay's directed-broadcast address, from the same `subnet`
+    /// prefix `tun.configure()` puts on the interface. See
+    /// [`directed_broadcast`].
+    pub fn broadcast_addr(&self) -> Option<Ipv4Addr> {
+        directed_broadcast(self.ip_addr().ok()?, self.network.subnet)
+    }
+}
+
+/// Directed-broadcast address of `ip/prefix` (host bits all set), or None
+/// when the prefix has no broadcast (/31, /32) or is out of range.
+///
+/// This used to be hardcoded as "first three octets + .255", i.e. it assumed
+/// /24. On a /16 overlay (klas, 2026-10-16) the kernel treats 10.100.10.255
+/// as an ordinary host address, so a "broadcast" WolfNet delivered into the
+/// TUN got forwarded straight back out of it, and the two nodes bounced
+/// every WolfDisk discovery packet back and forth between them.
+pub fn directed_broadcast(ip: Ipv4Addr, prefix: u8) -> Option<Ipv4Addr> {
+    if prefix > 30 {
+        return None;
+    }
+    let host_mask = u32::MAX.checked_shr(u32::from(prefix)).unwrap_or(0);
+    Some(Ipv4Addr::from(u32::from(ip) | host_mask))
 }
 
 impl Default for Config {
@@ -362,6 +385,22 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directed_broadcast_follows_the_prefix_not_a_fixed_24() {
+        let ip: Ipv4Addr = "10.100.10.7".parse().unwrap();
+        assert_eq!(directed_broadcast(ip, 24), Some("10.100.10.255".parse().unwrap()));
+        // The klas case: on a /16 the broadcast is .255.255, and .10.255 is a host.
+        assert_eq!(directed_broadcast(ip, 16), Some("10.100.255.255".parse().unwrap()));
+        assert_eq!(directed_broadcast(ip, 20), Some("10.100.15.255".parse().unwrap()));
+        assert_eq!(directed_broadcast(ip, 8), Some("10.255.255.255".parse().unwrap()));
+        assert_eq!(directed_broadcast(ip, 0), Some(Ipv4Addr::BROADCAST));
+        assert_eq!(directed_broadcast(ip, 30), Some("10.100.10.7".parse().unwrap()));
+        // No broadcast address exists on point-to-point / host prefixes.
+        assert_eq!(directed_broadcast(ip, 31), None);
+        assert_eq!(directed_broadcast(ip, 32), None);
+        assert_eq!(directed_broadcast(ip, 33), None);
+    }
 
     const HEADER: &str = "\
 [network]
