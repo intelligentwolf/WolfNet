@@ -610,6 +610,12 @@ fn run_daemon(config_path: &PathBuf) {
         error!("Failed to configure TUN: {}", e);
         std::process::exit(1);
     });
+    if tun.reattached() {
+        info!("Reattached to {} kept by the previous daemon — connections over it survived the restart", tun.name());
+    }
+    // A marker nobody consumed (written while WolfNet was already stopped)
+    // must not turn a later, ordinary stop into a handoff.
+    let _ = std::fs::remove_file(RESTART_HANDOFF_PATH);
 
     // Create UDP socket
     let bind_addr = format!("{}:{}", config.network.bind_address, config.network.listen_port);
@@ -760,6 +766,12 @@ fn run_daemon(config_path: &PathBuf) {
     let mut broadcast_targets: Vec<(Ipv4Addr, Option<Ipv4Addr>)> = Vec::with_capacity(64);
     let mut broadcast_relayed: std::collections::HashSet<Ipv4Addr> = std::collections::HashSet::with_capacity(64);
     let mut last_handshake = Instant::now();
+    // Handshake now, not on the first 10s tick. A freshly started daemon sees
+    // every peer as disconnected and encrypt_and_send refuses to send to one,
+    // while the peers still see US as connected and so never handshake first.
+    // Waiting for the tick left a restarted node unable to send for up to 10s
+    // — longer than Galera's default 5s suspect timeout over the overlay.
+    transport::send_handshakes(&socket, &keypair, &peer_manager, wolfnet_ip, config.network.listen_port, &hostname, is_gateway);
     let mut last_keepalive = Instant::now();
     let mut last_pex = Instant::now();
     let mut last_dns_resolve = Instant::now();
@@ -1228,11 +1240,43 @@ fn run_daemon(config_path: &PathBuf) {
 
     // Cleanup
     info!("Shutting down WolfNet...");
+    if take_restart_handoff() {
+        // Keep wolfnet0 (address and routes included) for the daemon that is
+        // about to start. Without this the kernel deletes the interface when
+        // our fd closes, and every TCP session over the overlay — a Galera
+        // cluster, say — loses its local address until the new daemon has
+        // rebuilt it.
+        match tun.set_persist(true) {
+            Ok(()) => info!("Restart handoff: keeping {} for the next daemon", tun.name()),
+            Err(e) => warn!("Restart handoff: could not keep {}: {}", tun.name(), e),
+        }
+    }
     if config.network.gateway {
         wolfnet::gateway::disable_gateway(tun.name(), &config.cidr());
     }
     let _ = std::fs::remove_file("/var/run/wolfnet/status.json");
     info!("WolfNet stopped.");
+}
+
+/// Written by whoever is about to restart WolfNet (WolfStack, setup.sh) just
+/// before stopping it. Its presence at shutdown means "a new daemon follows —
+/// keep the interface". A plain stop leaves no marker and removes the
+/// interface, as it always has.
+const RESTART_HANDOFF_PATH: &str = "/var/run/wolfnet/restart-handoff";
+
+/// How old a marker may be and still count. Covers a slow `systemctl stop`;
+/// anything older belongs to a restart that never reached us.
+const RESTART_HANDOFF_MAX_AGE: Duration = Duration::from_secs(120);
+
+/// Consume the restart-handoff marker; true if it was there and fresh.
+fn take_restart_handoff() -> bool {
+    let fresh = std::fs::metadata(RESTART_HANDOFF_PATH)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age <= RESTART_HANDOFF_MAX_AGE);
+    let _ = std::fs::remove_file(RESTART_HANDOFF_PATH);
+    fresh
 }
 
 fn ctrlc_handler(running: Arc<AtomicBool>) {

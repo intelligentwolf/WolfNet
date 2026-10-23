@@ -209,6 +209,9 @@ fi
 if systemctl is-active --quiet wolfnet 2>/dev/null; then
     echo ""
     echo "Stopping WolfNet service for upgrade..."
+    # Tell the daemon a new one follows, so it keeps wolfnet0 (address and
+    # routes) and connections over the overlay survive the upgrade.
+    mkdir -p /var/run/wolfnet && touch /var/run/wolfnet/restart-handoff
     systemctl stop wolfnet
     sleep 2
     echo "✓ Service stopped"

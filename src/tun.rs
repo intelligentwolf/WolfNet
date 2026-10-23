@@ -14,6 +14,12 @@ use tracing::warn;
 const TUNSETIFF: libc::c_ulong = 0x800454ca;
 #[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
 const TUNSETIFF: libc::c_ulong = 0x400454ca;
+// TUNSETPERSIST = _IOW('T', 203, c_int) — /usr/include/linux/if_tun.h:35.
+// Same _IOW encoding as TUNSETIFF above, one ioctl number higher.
+#[cfg(any(target_arch = "powerpc", target_arch = "powerpc64"))]
+const TUNSETPERSIST: libc::c_ulong = 0x800454cb;
+#[cfg(not(any(target_arch = "powerpc", target_arch = "powerpc64")))]
+const TUNSETPERSIST: libc::c_ulong = 0x400454cb;
 const IFF_TUN: libc::c_short = 0x0001;
 const IFF_NO_PI: libc::c_short = 0x1000;
 
@@ -21,6 +27,9 @@ const IFF_NO_PI: libc::c_short = 0x1000;
 pub struct TunDevice {
     fd: RawFd,
     name: String,
+    /// The interface already existed when we attached — a previous daemon
+    /// left it behind for us with TUNSETPERSIST during a restart handoff.
+    reattached: bool,
 }
 
 #[repr(C)]
@@ -51,6 +60,15 @@ impl TunDevice {
         let copy_len = name_bytes.len().min(15);
         req.ifr_name[..copy_len].copy_from_slice(&name_bytes[..copy_len]);
 
+        // TUNSETIFF attaches to an existing persistent TUN of the same name
+        // rather than creating one, keeping its addresses and routes.
+        // if_nametoindex asks the kernel about the caller's own network
+        // namespace; /sys/class/net reflects whichever namespace sysfs was
+        // mounted from, which in a container can be the host's.
+        let reattached = std::ffi::CString::new(name)
+            .map(|c| unsafe { libc::if_nametoindex(c.as_ptr()) } != 0)
+            .unwrap_or(false);
+
         // Create the TUN device
         let ret = unsafe { libc::ioctl(fd, TUNSETIFF as _, &mut req as *mut _) };
         if ret < 0 {
@@ -67,17 +85,61 @@ impl TunDevice {
             .to_string();
 
 
-        Ok(Self { fd, name: actual_name })
+        let dev = Self { fd, name: actual_name, reattached };
+        if reattached {
+            // Hand the interface's lifetime back to this fd, so a crash
+            // removes it exactly as it always has. Only a deliberate restart
+            // handoff (set_persist(true) at shutdown) keeps it.
+            if let Err(e) = dev.set_persist(false) {
+                warn!("Could not clear persist flag on {}: {}", dev.name, e);
+            }
+        }
+        Ok(dev)
+    }
+
+    /// Whether this daemon attached to an interface a previous one kept alive.
+    pub fn reattached(&self) -> bool {
+        self.reattached
+    }
+
+    /// Mark the interface persistent (or not). A persistent TUN outlives the
+    /// fd closing: the interface, its addresses and every route through it
+    /// stay in the kernel, so TCP sessions over the overlay ride out a
+    /// daemon restart instead of losing their local address.
+    pub fn set_persist(&self, persist: bool) -> Result<(), std::io::Error> {
+        // TUNSETPERSIST takes its argument by value, not by pointer.
+        let ret = unsafe { libc::ioctl(self.fd, TUNSETPERSIST as _, persist as libc::c_ulong) };
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
     }
 
     /// Configure the interface with an IP address and bring it up
     pub fn configure(&self, address: &str, subnet: u8, mtu: u16) -> Result<(), Box<dyn std::error::Error>> {
-        // Set IP address
-        let status = std::process::Command::new("ip")
-            .args(["addr", "add", &format!("{}/{}", address, subnet), "dev", &self.name])
-            .status()?;
-        if !status.success() {
-            return Err(format!("Failed to set IP address on {}", self.name).into());
+        // Set IP address. A reattached interface may already carry it, and
+        // `ip addr add` of an existing address fails — which used to exit the
+        // daemon. Leave a matching address alone (removing it would kill
+        // every socket bound to it) and drop only ones the config no longer
+        // names.
+        let wanted = format!("{}/{}", address, subnet);
+        let mut present = false;
+        for existing in self.ipv4_addresses() {
+            if existing == wanted {
+                present = true;
+            } else {
+                let _ = std::process::Command::new("ip")
+                    .args(["addr", "del", &existing, "dev", &self.name])
+                    .status();
+            }
+        }
+        if !present {
+            let status = std::process::Command::new("ip")
+                .args(["addr", "add", &wanted, "dev", &self.name])
+                .status()?;
+            if !status.success() {
+                return Err(format!("Failed to set IP address on {}", self.name).into());
+            }
         }
 
         // Set MTU
@@ -147,6 +209,26 @@ impl TunDevice {
         }
 
         Ok(())
+    }
+
+    /// IPv4 addresses on the interface, as `a.b.c.d/prefix`.
+    fn ipv4_addresses(&self) -> Vec<String> {
+        let out = match std::process::Command::new("ip")
+            .args(["-4", "-o", "addr", "show", "dev", &self.name])
+            .output()
+        {
+            Ok(o) if o.status.success() => o.stdout,
+            _ => return Vec::new(),
+        };
+        // `-o` prints one line per address: "N: dev    inet A/P brd ... scope ..."
+        String::from_utf8_lossy(&out)
+            .lines()
+            .filter_map(|line| {
+                let mut words = line.split_whitespace();
+                words.find(|w| *w == "inet")?;
+                words.next().map(str::to_string)
+            })
+            .collect()
     }
 
     /// Read a packet from the TUN device (blocking if data available)
